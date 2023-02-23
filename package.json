@@ -1,0 +1,22 @@
+{
+  "name": "jlc-websocket",
+  "version": "1.0.0",
+  "author": "Joakim L. Christiansen (https://joakimch.github.io)",
+  "license": "MIT",
+  "type": "module",
+  "main": "source/websocket.js",
+  "files": [
+    "source/*"
+  ],
+  "repository": "github:JoakimCh/jlc-websocket",
+  "funding": "https://joakimch.github.io/funding.html",
+  "description": "",
+  "keywords": [
+    "ws",
+    "websocket",
+    "web",
+    "socket",
+    "server",
+    "client"
+  ]
+}
