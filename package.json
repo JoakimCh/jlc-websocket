@@ -1,6 +1,6 @@
 {
   "name": "jlc-websocket",
-  "version": "1.0.0",
+  "version": "0.9.0",
   "author": "Joakim L. Christiansen (https://joakimch.github.io)",
   "license": "MIT",
   "type": "module",
