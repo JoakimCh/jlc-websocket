@@ -149,7 +149,7 @@ export class Trigger {
     })
   }
 
-  /** The promise wich is resolved when triggered. If values were used with the switches they will be returned here, either as an object (if named switches) or as an array. */
+  /** The promise which is resolved when triggered. If values were used with the switches they will be returned here, either as an object (if named switches) or as an array. */
   get promise() {return this.#promise}
 
   /** If you want to reject the trigger promise with an error. */

@@ -39,9 +39,10 @@ export class ProtocolReader extends Transform {
   #messageStreamTrigger
   // #config
   #messageHandler; #pingHandler; #pongHandler; #closeHandler
-  #binaryType
+  binaryType
   #keepSlidingWindow
   checkCloseCode = true
+  jsonMode
   //#endregion
 
   constructor({
@@ -49,11 +50,13 @@ export class ProtocolReader extends Transform {
     config,
     isClient,
     binaryType,
+    jsonMode,
     messageHandler, pingHandler, pongHandler, closeHandler
   }) {
     super(options)
     // this.#config = config
-    this.#binaryType = binaryType
+    this.binaryType = binaryType
+    this.jsonMode = jsonMode
     this.#messageHandler = messageHandler
     this.#pingHandler = pingHandler
     this.#pongHandler = pongHandler
@@ -165,7 +168,7 @@ export class ProtocolReader extends Transform {
     let data = this.#emitFragments ? this.#frame.payload : this.#msgPayload
     if (this.#msgOpcode == Opcode.binary) {
       data = data.length > 1 ? Buffer.concat(data) : data[0] || emptyBuffer
-      switch (this.#binaryType) {
+      switch (this.binaryType) {
         case 'blob': data = new Blob([data]); break
         case 'arraybuffer': {
           const {buffer, byteOffset, length} = data
@@ -182,6 +185,14 @@ export class ProtocolReader extends Transform {
         data = decoder.decode(data.length > 1 ? Buffer.concat(data) : data[0])
       } catch (error) {
         return this.#error(1007, 'Invalid UTF-8 encoded text.')
+      }
+    }
+    if (this.jsonMode) {
+      if (typeof data != 'string') return this.#error(1007, 'Wanted JSON but received binary message.')
+      try {
+        data = JSON.parse(data)
+      } catch (error) {
+        return this.#error(1007, 'Received message with invalid JSON.')
       }
     }
     this.#messageHandler(data, this.#frame.isFinal)
@@ -218,7 +229,6 @@ export class ProtocolReader extends Transform {
       return this.#error(1002, 'A client MUST mask any payloads that it sends to the server.')
     }
     if (hasMask) this.#masker.newMask(mask)
-    // debug('isClient', this.#isClient, this.#frame)
     switch (opcode) {
       default: return this.#error(1002, 'Invalid WebSocket opcode: '+opcode)
       case Opcode.ping: if (!payloadSize) this.#handlePingFrame(); break
@@ -229,7 +239,6 @@ export class ProtocolReader extends Transform {
         if (this.#emitFragments && !this.#messageStream) this.#frame.payload = this.#msgOpcode == Opcode.text ? '' : []
         if (payloadSize == 0 && isFinal) {
           this.#consumePayloadChunk(emptyBuffer)
-          // this.#emitMessage()
         }
       break
       case Opcode.binary: case Opcode.text: // new message
@@ -258,7 +267,6 @@ export class ProtocolReader extends Transform {
 
   /** Creates a reduced view of `#chunks[0]` according to `#chunkOffset` and of course sets `#chunkOffset` back to 0. */
   #trimCurrentChunk() {
-    // if (this.#chunkOffset == 0) return
     this.#chunks[0] = this.#chunks[0].subarray(this.#chunkOffset)
     this.#chunkOffset = 0
   }
@@ -377,10 +385,8 @@ export class ProtocolReader extends Transform {
   }
 
   #decompressChunk(chunk, finalChunkOfFrame, finalChunkOfMsg) {
-    // debug(chunk.length, {finalChunkOfFrame})
     return new Promise(async (resolve, reject) => {
-      if (this.#inflater.writableNeedDrain) await drainPromise(this.#inflater)
-      // debug(chunk.length, chunk.subarray(0,4), chunk.subarray(-4))
+      if (this.#inflater.writableNeedDrain) await drainPromise(this.#inflater) // never seen this happen, but just in case
       this.#inflater.write(chunk, error => {
         if (error) reject(error)
         else if (!finalChunkOfFrame) resolve()
@@ -388,54 +394,43 @@ export class ProtocolReader extends Transform {
       if (finalChunkOfMsg) { // then add ZZZZFFFF
         if (this.#inflater.writableNeedDrain) await drainPromise(this.#inflater)
         this.#inflater.write(ZZZZFFFF, error => {if (error) reject(error)})
-        // debug('ZZZZFFFF')
       }
       if (finalChunkOfFrame) { // then flush
         this.#inflater.flush(finalChunkOfMsg && !this.#keepSlidingWindow ? zlib.constants.Z_FULL_FLUSH : zlib.constants.Z_SYNC_FLUSH, error => {
           if (error) return reject(error)
           if (!this.#inflatedChunks.length) {
-            // debug('What the fuck?')
-            // setTimeout(() => {
-            //   debug(this.#inflatedChunks)
-            // }, 200)
-            // throw Error('No way?')
             this.#inflatedChunks.push(emptyBuffer)
           }
           resolve()
         })
       }
     })
-    // inflater has on data handler that writes to #inflatedChunks
+    // inflater has an on data handler that writes to #inflatedChunks
   }
 
   async #consumePayloadChunk(chunk) {
     this.#frame.payloadConsumed += chunk.length
     const finalChunkOfFrame = this.#frame.payloadConsumed == this.#frame.payloadSize
-    // debug(this.#frame.payloadSize, this.#frame.payloadConsumed, this.#frame.isFinal)
     const finalChunkOfMsg = this.#frame.isFinal && finalChunkOfFrame
     if (finalChunkOfFrame) {
       this.#next = this.#readNext.header1
       this.#nextSize = 2
     }
-    // debug('payload chunk', this.#frame, finalChunkOfFrame)
     if (this.#isServer) this.#masker.maskInPlace(chunk)
     if (this.#msgCompressed) {
       try {
         await this.#decompressChunk(chunk, finalChunkOfFrame, finalChunkOfMsg)
       } catch (error) {
-        debug('decompressChunk error', error)
         return this.#error(1002, 'Decompression error: '+error)
       }
       if (!this.#inflatedChunks.length) return
       chunk = this.#inflatedChunks.length > 1 ? Buffer.concat(this.#inflatedChunks) : this.#inflatedChunks[0]
       this.#inflatedChunks.length = 0
-      // debug(chunk)
     }
     switch (this.#frame.opcode) {
       default: this.#frame.payload.push(chunk); break
       case Opcode.binary: case Opcode.text: case Opcode.continuation:
         if (this.#consumeMessagePayloadChunk(chunk)) return
-        // if (this.destroyed) return
     }
     if (finalChunkOfFrame && this.#frame.isControlFrame) {
       switch (this.#frame.opcode) {

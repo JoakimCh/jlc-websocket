@@ -1,44 +1,9 @@
-/*
-The WebSocket Protocol (v13 December 2011):
-https://www.rfc-editor.org/rfc/rfc6455.html
 
-Compression Extensions for WebSocket:
-https://www.rfc-editor.org/rfc/rfc7692.html
-
-WebSocket API Spec:
-https://websockets.spec.whatwg.org/
-
-https://stackoverflow.com/questions/9239466/what-are-the-protocol-differences-between-websockets-versions
-
-auto-reconnect:
-https://www.rfc-editor.org/rfc/rfc6455.html#section-7.2.3
-
-todo:
-  allow send to receive a stream which will stream fragments until end of stream
-
-<promise> done = sendStream([stream]) // send a stream as a binary message
-  Get a stream you can use to write a message or supply one that will be piped. A promise is resolved when stream has been sent, so you can optionally await this and then e.g. send another.
-
-sendUtf8Stream([stream]) // same but data must be UTF-8
-
-<promise> stream = receiveStream([stream and/or timeout])
-  Get the next message as a stream. Returns a promise which resolves when the next message begins.
-  If given a stream it will pipe the message into it. And you can .then() to know if that message actually came (true) or if it timed out.
-  If timeout it will resolve false.
-
-Errors during connection (constructor) will probably not be possible to catch, so use the error event instead for these!
-
-Have a "receive stream" the socket pipes into, this decodes frames, payloads and emits events continuosly. This will then write chunks (that it unmasked) into decompess (not pipe, because then it might overflow). The decompress will pipe data into a passthrough and end the passthrough when done (but not end itself). The passthrough can be a submitted stream or one we create to give away. If receive buffer then the passthrough will build one and emit it.
-
-When sending a buffer we can write the frame first (no fragments) and then stream the result of compress into the socket (but removing 0x0000FFFF when needed? maybe with passthrough). But when sending stream we pass it into a frame transform which emits frames for each fragment (where it decides the fragment size).
-*/
 import {EventEmitter} from 'node:events'
 import {ProtocolReader} from './protocolReader.js'
 import {ProtocolWriter} from './protocolWriter.js'
 import {WebSocketError, deepFreeze, Mutex} from './div.js'
 import {closeCodeExplanation} from './protocolRelated.js'
-
-globalThis.debug = console.log
 
 function makeInstanceGettersEnumerable(object) { // from: https://stackoverflow.com/a/57179513/4216153
   const prototype = Object.getPrototypeOf(object)
@@ -62,7 +27,6 @@ export class WebSocket extends EventEmitter {
   #ioStream; #protocolWriter; #protocolReader; #isClient; #isServer
   config = {} // will be locked
   #defaultConfig = {
-    debug: false, // if true then compression is always applied when enabled (ignoring any thresholds)
     httpHeaders: {}, // any custom http headers to send with the request (client) or response (server)
     // compression: false,
     compression: { // true/false or config
@@ -79,7 +43,7 @@ export class WebSocket extends EventEmitter {
     maxFragmentSize: 1024 * 16, // split messages into fragments up to this size if the message is larger
     maxMessageSize: false, // max size of message to receive, fails the connection if needed (todo)
     utf8failFast: false, // whether to decode incoming UTF-8 data when received (slow) or wait until all is received (fast)
-    zeroMasking: true, // whether the client should use a mask of 0x00000000 and in effect skip applying it, gives best performance, but legacy servers might have an issue with this
+    zeroMasking: true, // whether the client should use a mask of 0x00000000 and in effect skip applying it (best performance, but legacy servers might have an issue with this)
     // outgoingHighWaterMark: 1024 * 16,
     incomingHighWaterMark: 1024 * 32, // for incoming protocol data
     receiveFragmentedMessages: false,
@@ -89,17 +53,19 @@ export class WebSocket extends EventEmitter {
     pongTimeout: 1000, // if no pong received within this time after a ping then fail the connection
     allowRedirections: true, // endpoint redirections
     maxRedirections: 10,
-    automaticReconnect: { // true/false or config
-      failedAttemptDelay: 2000,
-      maxAttempts: 10,
-      progressiveDelay: 500,
-      maxDelay: 10_000,
-      retryAtInternetReturn: true
-    }
+    // automaticReconnect: { // true/false or config
+    //   failedAttemptDelay: 2000,
+    //   maxAttempts: 10,
+    //   progressiveDelay: 500,
+    //   maxDelay: 10_000,
+    //   retryAtInternetReturn: true
+    // }
   }
   #pingMutex = new Mutex() // unlocks when pong is received or times out
   #closeCalled; #closeFrameSent; #closeFrameReceived; #closeCode; #closeReason
   #forcedTerminationTimeout
+  /** Whether to send and receive messages as JSON. */
+  jsonMode
 
   get isClient() {return this.#isClient}
   get isServer() {return this.#isServer}
@@ -111,6 +77,12 @@ export class WebSocket extends EventEmitter {
       case 'blob': case 'arraybuffer': case 'nodebuffer':
     }
     this.#binaryType = value
+    if (this.#protocolReader) this.#protocolReader.binaryType = this.#binaryType
+  }
+  set jsonMode(on) {
+    this.jsonMode = on
+    if (this.#protocolReader) this.#protocolReader.jsonMode = this.jsonMode
+    if (this.#protocolWriter) this.#protocolWriter.jsonMode = this.jsonMode
   }
   get readyStateAsString() {
     switch (this.#readyState) {
@@ -158,10 +130,14 @@ export class WebSocket extends EventEmitter {
       ...this.#defaultConfig,
       ...config
     }
-    this.config.automaticReconnect = {
-      ...this.#defaultConfig.automaticReconnect,
-      ...config.automaticReconnect
+    this.config.compression = {
+      ...this.#defaultConfig.compression,
+      ...config.compression
     }
+    // this.config.automaticReconnect = {
+    //   ...this.#defaultConfig.automaticReconnect,
+    //   ...config.automaticReconnect
+    // }
     this.#configSanityCheck()
     if (url) {
       this.#isClient = true; this.#isServer = false
@@ -225,7 +201,6 @@ export class WebSocket extends EventEmitter {
     this.#forcedTerminationTimeout = setTimeout( // if not closed within a reasonable time
       () => {
         this.#ioStream.destroy().unref()
-        debug('# forced termination of connection #')
       }, 
       this.config.forcedTerminationTimeout, 
     )
@@ -331,17 +306,17 @@ export class WebSocket extends EventEmitter {
         throw new WebSocketError('INVALID_ARGS', 'Invalid key in config object: '+key)
       }
     }
-    if ('automaticReconnect' in config) {
-      if (typeof config.automaticReconnect == 'object') {
-        for (const key in config.automaticReconnect) {
-          if (!(key in this.#defaultConfig.automaticReconnect)) {
-            throw new WebSocketError('INVALID_ARGS', 'Invalid key in config.automaticReconnect: '+key)
-          }
-        }
-      } else if (typeof config != 'boolean') {
-        throw new WebSocketError('INVALID_ARGS', 'config.automaticReconnect must be true|false or a configuration object.')
-      }
-    }
+    // if ('automaticReconnect' in config) {
+    //   if (typeof config.automaticReconnect == 'object') {
+    //     for (const key in config.automaticReconnect) {
+    //       if (!(key in this.#defaultConfig.automaticReconnect)) {
+    //         throw new WebSocketError('INVALID_ARGS', 'Invalid key in config.automaticReconnect: '+key)
+    //       }
+    //     }
+    //   } else if (typeof config != 'boolean') {
+    //     throw new WebSocketError('INVALID_ARGS', 'config.automaticReconnect must be true|false or a configuration object.')
+    //   }
+    // }
     return {url, protocols, config, request}
   }
 
@@ -358,7 +333,7 @@ export class WebSocket extends EventEmitter {
     this.#ioStream = ioStream
     this.#protocol = protocol
     this.#extensions = extensions
-    deepFreeze(this.config)
+    deepFreeze(this.config) // nothing in it can change at runtime
 
     // ioStream.setNoDelay() // doesn't really help performance
     ioStream.off('error', currentStreamErrorHandler)
@@ -400,6 +375,7 @@ export class WebSocket extends EventEmitter {
       config: this.config,
       isClient: this.#isClient,
       binaryType: this.#binaryType,
+      jsonMode: this.jsonMode,
       messageHandler: this.#messageHandler.bind(this),
       pingHandler: this.#receivePing.bind(this),
       pongHandler: this.#receivePong.bind(this),
@@ -465,7 +441,7 @@ export class WebSocket extends EventEmitter {
   /** Answer a ping frame with a pong frame. */
   #receivePing(payload) {
     if (this.#closeFrameReceived) {
-      return this.#protocolError({code: 1002, reason: 'Ping received after close.'})
+      return //this.#protocolError({code: 1002, reason: 'Ping received after close.'})
     }
     this.#protocolWriter.pong(payload)
   }

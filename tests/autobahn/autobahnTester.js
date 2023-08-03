@@ -1,12 +1,27 @@
 
 import * as fs from 'node:fs'
 import * as http from 'node:http'
+import * as n_os from 'os'
 import {fileURLToPath} from 'node:url'
 import {dirname, sep as pathSep} from 'path'
 import {spawn, spawnSync} from 'node:child_process'
 import * as readline from 'node:readline/promises'
 
-const log = console.log
+function getLocalIPs() {
+  const IPs = [], ifaces = n_os.networkInterfaces()
+  for (const ifname of Object.keys(ifaces)) {
+    for (const iface of ifaces[ifname]) {
+      if ('IPv4' !== iface.family || iface.internal !== false) {
+        // skip over internal (i.e. 127.0.0.1) and non-ipv4 addresses
+        break
+      }
+      IPs.push(iface.address)
+    }
+  }
+  return IPs
+}
+
+globalThis.log = console.log
 const rl = readline.createInterface({
   input: process.stdin, 
   output: process.stdout
@@ -19,13 +34,14 @@ let serverTestInProgress, clientTestInProgress
 try {
   parseIndex()
 } catch (error) {
-  spawnSync('wstest', ['-m', 'fuzzingclient'], {cwd: scriptDirectory}) // generate index
+  // spawnSync('wstest', ['-m', 'fuzzingclient'], {cwd: scriptDirectory}) // generate index
   parseIndex() // try again
 }
 
 export function autobahnClientTest(WebSocket, agent, {
   endpoint = 'ws://127.0.0.1:9902',
-  casesToRun, casesToExclude, quickTest
+  casesToRun, casesToExclude, quickTest,
+  webSocketConfig
 } = {}) {
   if (clientTestInProgress) throw Error('Wait for other client test to end before running another.')
   clientTestInProgress = true
@@ -57,7 +73,9 @@ export function autobahnClientTest(WebSocket, agent, {
   })
   process.on('exit', _code => {
     fuzzerShouldClose = true
-    fuzzer?.kill()
+    spawnSync('docker', 'stop fuzzingserver'.split(' '))
+    spawnSync('docker', 'stop fuzzingclient'.split(' '))
+    // fuzzer?.kill()
   }) // this will kill wstest on errors, but not run its close event
 
   if (!casesToRun) {
@@ -79,10 +97,15 @@ export function autobahnClientTest(WebSocket, agent, {
     }
     configureTests(false, endpoint, toRunFilter, casesToExclude)
   }
-  
-  fuzzer = spawn('wstest', ['-m', 'fuzzingserver'], {
+  //docker remove -f fuzzingserver
+  // log('Killing any previous fuzzingserver docker image:')
+  const {output} = spawnSync('docker', 'remove -f fuzzingserver'.split(' '), {encoding: 'utf-8'})
+  // log('Output:', output)
+  log('Starting the fuzzingserver docker image:')
+  fuzzer = spawn('docker', 'run --rm -v "${PWD}/config:/config" -v "${PWD}/reports:/reports" -p 9902:9902 --name fuzzingserver crossbario/autobahn-testsuite'.split(' '), {
+    shell: true,
     cwd: scriptDirectory, 
-    detached: true // so SIGINT isn't propagated to the child
+    // detached: true // so SIGINT isn't propagated to the child
   })
   fuzzer.stdout.setEncoding('utf-8'); fuzzer.stderr.setEncoding('utf-8')
   fuzzer.stdout.on('data', text => {fuzzerStdout += text})
@@ -97,6 +120,7 @@ export function autobahnClientTest(WebSocket, agent, {
     if (!fuzzerShouldClose) {
       log('Autobahn fuzzingserver closed for some unknown reason...')
       log('Tests terminated.')
+      log({fuzzerStderr, fuzzerStdout})
       process.exit(1)
     }
     listFailed(false, agent, true, quickTest)
@@ -104,21 +128,27 @@ export function autobahnClientTest(WebSocket, agent, {
   })
   fuzzer.on('spawn', () => {
     setTimeout(async () => {
-      let lastCat
+      let lastCat, connectionFailure
       for (const {id, shortDescription, categoryIndex, subCategoryIndex} of casesToRun) {
         if (categoryIndex != lastCat && categoryIndex != undefined) {
           log('# In category:', categories[categoryIndex].description+':')
         }
         lastCat = categoryIndex
-        await runSingle(id)
+        if (!await runSingle(id)) {
+          connectionFailure = true
+          log(id+' could not establish a connection, test not completed.')
+          log('Terminating the rest of the tests!')
+          break
+        }
         if (lastReportTime < Date.now() - 1000 * 5) {
           await updateReports()
         }
       }
-      log('All tests completed.')
+      if (!connectionFailure) log('All tests completed.')
       await updateReports()
       fuzzerShouldClose = true
-      fuzzer.kill()
+      spawnSync('docker', 'stop fuzzingserver'.split(' '))
+      // fuzzer.kill()
     }, 1000)
   })
 
@@ -140,7 +170,7 @@ export function autobahnClientTest(WebSocket, agent, {
       return new Promise(resolve => {
         let didOpen, startTime
         const queryString = new URLSearchParams({casetuple: testId, agent})
-        const ws = new WebSocket(endpoint+'/runCase?'+queryString, {debug: true})
+        const ws = new WebSocket(endpoint+'/runCase?'+queryString, webSocketConfig)
         ws.addEventListener('open', () => {
           didOpen = true
           log(testId+' started...')
@@ -166,16 +196,17 @@ export function autobahnClientTest(WebSocket, agent, {
         })
       })
     }
+
     let retries = 0
     while (await runTest()) { // while connection fails
       await new Promise(resolve => setTimeout(resolve, 1000))
       if (++retries == maxConnectionRetries) {
-        log(testId+' could not establish a connection, test not completed.')
-        log('Terminating the rest of the tests!')
-        process.exit(1) // break
+        return false
       }
       log(testId+' failed to connect, retrying...')
     }
+
+    return true
   }
 
   return donePromise
@@ -183,8 +214,9 @@ export function autobahnClientTest(WebSocket, agent, {
 
 // Note: fuzzingclient only updates reports when finished running the selected tests, hence we do not try to run them all in one run and risk having no reports on an early exit.
 export function autobahnServerTest(WebSocket, agent, {
-  endpoint = 'ws://127.0.0.1:9901',
-  casesToRun, casesToExclude, quickTest
+  endpoint = 'ws://'+getLocalIPs()[0]+':9901',
+  casesToRun, casesToExclude, quickTest,
+  webSocketConfig
 } = {}) {
   if (serverTestInProgress) throw Error('Wait for other server test to end before running another.')
   serverTestInProgress = true
@@ -250,18 +282,23 @@ export function autobahnServerTest(WebSocket, agent, {
       socket.end('HTTP/1.1 400 Bad Request\r\n\r\n').unref()
       return
     }
-    const options = {httpHeaders: {'Server': agent}}
-    wsConnectionHandler(new WebSocket(request, options))
+    wsConnectionHandler(new WebSocket(request, webSocketConfig))
   })
   .listen(url.port, url.hostname)
 
   wsServer.on('listening', async () => {
-    log('Server ready for testing...')
+    log('Server ready for testing...', url.port)
     async function runBatch() {
       fuzzerShouldClose = new Trigger()
       const fuzzerShouldCloseRef = fuzzerShouldClose
       configureTests(true, endpoint, batch.map(test => test.id)) // write config
-      fuzzer = spawn('wstest', ['-m', 'fuzzingclient'], {cwd: scriptDirectory})
+      // fuzzer = spawn('wstest', ['-m', 'fuzzingclient'], {cwd: scriptDirectory})
+      spawnSync('docker', 'remove -f fuzzingclient'.split(' '))
+      fuzzer = spawn('docker', 'run --rm -v "${PWD}/config:/config" -v "${PWD}/reports:/reports" --name fuzzingclient crossbario/autobahn-testsuite wstest -m fuzzingclient -s /config/fuzzingclient.json'.split(' '), {
+        cwd: scriptDirectory,
+        shell: true,
+        detached: true
+      })
       let fuzzerStdout = '', fuzzerStderr = ''
       fuzzer.stdout.setEncoding('utf-8'); fuzzer.stderr.setEncoding('utf-8')
       fuzzer.stdout.on('data', text => {fuzzerStdout += text})
@@ -270,13 +307,14 @@ export function autobahnServerTest(WebSocket, agent, {
         fuzzer.on('close', async (code, signal) => {
           resolve()
           if (code == 1) {
-            log('Autobahn fuzzingserver crashed with this output in stderr:')
+            log('Autobahn fuzzingclient crashed with this output in stderr:')
             log(fuzzerStderr); log('Tests terminated.')
             process.exit(1)
           }
           if (!fuzzerShouldCloseRef.triggered) {
-            log('Autobahn fuzzingserver closed for some unknown reason...')
+            log('Autobahn fuzzingclient closed for some unknown reason...')
             log('Tests terminated.')
+            log({fuzzerStderr, fuzzerStdout})
             process.exit(1)
           }
         })
@@ -285,20 +323,21 @@ export function autobahnServerTest(WebSocket, agent, {
     }
     for (const test of casesToRun) {
       batch.push(test)
-      if (test.id.startsWith('9.') && batch.length < 5) {
-        continue // slow, batch only a few
-      } if ((test.id.startsWith('12.') || test.id.startsWith('13.'))) { 
-        // very slow tests, do no batch them
-      } else if (batch.length < 20) continue
-      await runBatch()
+      // if (test.id.startsWith('9.') && batch.length < 5) {
+      //   continue // slow, batch only a few
+      // } if ((test.id.startsWith('12.') || test.id.startsWith('13.'))) { 
+      //   // very slow tests, do no batch them
+      // } else if (batch.length < 20) continue
+      // await runBatch()
     }
     if (batch.length) runBatch() // run any leftovers
   })
 
-  donePromise.then(() => { // when done (if no crash)
+  donePromise.then(async () => { // when done (if no crash)
     serverTestInProgress = false
     wsServer.closeAllConnections()
     wsServer.close()
+    await new Promise(resolve => setTimeout(resolve, 1000))
     listFailed(true, agent, true, quickTest)
   })
 
@@ -318,14 +357,15 @@ export function autobahnServerTest(WebSocket, agent, {
       startTime = performance.now()
     })
     ws.on('message', ({data}) => {
-      ws.send(data)
       // log(data.length)
+      ws.send(data)
     })
     ws.on('error', error => {
       log(testId+' error event:', error)
       if (!didOpen) {
         log(testId+' failed to connect.')
         log('Tests terminated.')
+        spawnSync('docker', 'stop fuzzingclient'.split(' '))
         process.exit(1)
       }
     })
@@ -336,6 +376,7 @@ export function autobahnServerTest(WebSocket, agent, {
       if (numCasesRan == casesToRun.length) {
         setTimeout(() => {
           log('All tests completed.')
+          // spawnSync('docker', 'stop fuzzingclient'.split(' '))
           doneResolve()
         }, 1000)
       }
@@ -345,6 +386,7 @@ export function autobahnServerTest(WebSocket, agent, {
   return donePromise
 }
 
+/** Not by looking at the index.html file (which doesn't remember previously ran tests), but at the json files for earlier tests. */
 export function listFailed(forServerTest, agent, printFailed = true, quickTest) {
   agent = agent.replaceAll('-','_')
   const failures = []
@@ -363,11 +405,11 @@ export function listFailed(forServerTest, agent, printFailed = true, quickTest) 
         case 'NON-STRICT':
         case 'INFORMATIONAL': continue
         case 'OK': if (behaviorClose == 'OK') continue
-        case 'FAILED': case 'UNIMPLEMENTED': status = behavior
+        case 'FAILED': case 'UNIMPLEMENTED': status = behavior+' / '+behaviorClose
       }
     } else {
       if (globalThis.ignoreNotTested) continue
-      status = 'NOT TESTED'
+      status = 'NOT TESTED?'
     }
     let note = ''
     if (id == '7.7.8' && !forServerTest) note = 'Note: This is a bogus test since the server may not use 1010 as a close code.'
@@ -380,13 +422,28 @@ export function listFailed(forServerTest, agent, printFailed = true, quickTest) 
 }
 
 export function clearReports(forServerTest, agent) {
-  log('Clearing any previous reports for '+agent+'.')
   const path = scriptDirectory+'reports/'+(forServerTest ? 'servers' : 'clients')+'/'
-  const files = fs.readdirSync(path)
-  for (const fileName of files.filter(fileName => fileName.startsWith(agent.replaceAll('-','_')+'_case'))) {
-    fs.unlinkSync(path+fileName)
-    log(path+fileName)
+  let files
+  try {    
+    files = fs.readdirSync(path)
+    log('Clearing any previous reports for '+agent+'.')
+  } catch (error) {
+    return
   }
+  let cleared = 0
+  for (const fileName of files.filter(fileName => fileName.startsWith(agent.replaceAll('-','_')+'_case'))) {
+    try {
+      fs.unlinkSync(path+fileName)
+      cleared ++
+    } catch (error) {
+      if (error.code == 'EACCES') {
+        log('Error: You must be root (e.g. running this script with sudo) do delete any files/folders created by the docker image. Yup, blame the Autobahn developers...')
+        process.exit()
+      }
+      throw error
+    }
+  }
+  log('Cleared '+cleared+' reports.')
 }
 
 function getCasesToRun(casesToRunFilter, casesToExcludeFilter = []) {
@@ -481,7 +538,7 @@ function parseIndex() {
 
 function configureTests(serverTest, endpointUrl, toRun, toExclude) {
   const configFile = serverTest ? 'fuzzingclient.json' : 'fuzzingserver.json'
-  const config = JSON.parse(fs.readFileSync(scriptDirectory+configFile, 'utf-8'))
+  const config = JSON.parse(fs.readFileSync(scriptDirectory+'config/'+configFile, 'utf-8'))
   config['cases'] = toRun
   config['exclude-cases'] = toExclude || []
   if (serverTest) {
@@ -491,7 +548,7 @@ function configureTests(serverTest, endpointUrl, toRun, toExclude) {
     config['outdir'] = './reports/clients'
     config['url'] = endpointUrl
   }
-  fs.writeFileSync(scriptDirectory+configFile, JSON.stringify(config, null, 2))
+  fs.writeFileSync(scriptDirectory+'config/'+configFile, JSON.stringify(config, null, 2))
 }
 
 class Trigger {

@@ -20,23 +20,24 @@ export class ProtocolWriter {
   #deflater//; deflatedChunks = []
   #compression
   #keepSlidingWindow
-  #debug
   #errorHandler
   bufferedAmount = 0
+  jsonMode
 
   constructor({webSocket, ioStream, errorHandler}) {
     this.#ioStream = ioStream
     this.#isClient =  webSocket.isClient
     this.#errorHandler = errorHandler
     // this.minFragmentSize = webSocket.config.minFragmentSize
-    this.#debug = webSocket.config.debug
+    this.jsonMode = webSocket.jsonMode
     this.#zeroMasking = webSocket.config.zeroMasking
     this.#maxFragmentSize = webSocket.config.maxFragmentSize
     if (webSocket.config.compression) {
       this.#compression = webSocket.config.compression
       this.#keepSlidingWindow = this.#isClient ? this.#compression.clientKeepSlidingWindow : this.#compression.serverKeepSlidingWindow
       this.#deflater = new zlib.createDeflateRaw({
-        windowBits: this.#isClient ? this.#compression.clientMaxWindowBits : this.#compression.serverMaxWindowBits
+        windowBits: this.#isClient ? 
+          this.#compression.clientMaxWindowBits : this.#compression.serverMaxWindowBits
       })
       this.#deflater.on('error', error => this.#error(1011, 'deflater error: '+error))
     }
@@ -70,29 +71,31 @@ export class ProtocolWriter {
   }
 
   async send(data, allowCompression) {
-    const typeError = 'Data sent with message() must either be a String, Buffer, ArrayBuffer, TypedArray, DataView or Blob.'
-    if (typeof data == 'object') {
-      if (data instanceof Buffer) {
-        // all is good then
-      } else if (data instanceof ArrayBuffer) {
-        data = Buffer.from(data)
-      } else if (ArrayBuffer.isView(data)) {
-        data = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
-      } else if (data instanceof Blob) {
-        data = Buffer.from(await data.arrayBuffer())
-      } else {
+    if (this.jsonMode) {
+      data = JSON.stringify(data)
+    } else {
+      const typeError = 'Data sent with message() must either be a String, Buffer, ArrayBuffer, TypedArray, DataView or Blob.'
+      if (typeof data == 'object') {
+        if (data instanceof Buffer) {
+          // all is good then
+        } else if (data instanceof ArrayBuffer) {
+          data = Buffer.from(data)
+        } else if (ArrayBuffer.isView(data)) {
+          data = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+        } else if (data instanceof Blob) {
+          data = Buffer.from(await data.arrayBuffer())
+        } else {
+          throw new WebSocketError('TYPE_ERROR', typeError)
+        }
+      } else if (typeof data != 'string') {
         throw new WebSocketError('TYPE_ERROR', typeError)
       }
-    } else if (typeof data != 'string') {
-      throw new WebSocketError('TYPE_ERROR', typeError)
     }
     const isString = typeof data == 'string'
     if (isString) data = Buffer.from(data)
     const compress = (() => {
       if (this.#compression && allowCompression) {
-        if (this.#debug) {
-          return true
-        } else if (this.#compression.keepSlidingWindow) {
+        if (this.#compression.keepSlidingWindow) {
           if (data.length >= this.#compression.thresholdWithContext) return true
         } else {
           if (data.length >= this.#compression.thresholdNoContext) return true
@@ -103,7 +106,7 @@ export class ProtocolWriter {
     const {unlock} = await this.#msgMutex.lock()
     if (!this.#ioStream.writable) return unlock()
     if (data.length <= this.#maxFragmentSize) {
-      await this.#writeFrame(isString ? Opcode.text : Opcode.binary, data, compress)
+      await this.#writeFrame(isString ? Opcode.text : Opcode.binary, data, compress, true)
     } else {
       let offset = 0
       await this.#writeFrame(isString ? Opcode.text : Opcode.binary, data.subarray(offset, this.#maxFragmentSize), compress, false)
@@ -175,7 +178,6 @@ export class ProtocolWriter {
   }
 
   #error(code, reason) {
-    debug('protocolWriter error', {code, reason})
     this.#errorHandler({code, reason})
   }
 
@@ -185,12 +187,12 @@ export class ProtocolWriter {
     if (!this.#ioStream.writable) return
     let mask
     if (this.#isClient) mask = this.#zeroMasking ? 0 : this.#masker.newMask()
-    const head = frameHeader({opcode, isFinal, payloadSize: payload?.length, mask, compressionBit: compress})
     try {
       if (payload?.length) {
         if (compress) payload = await this.#compressPayload(payload, isFinal)
         if (this.#isClient && !this.#zeroMasking) this.#masker.maskInPlace(payload)
       }
+      const head = frameHeader({opcode, isFinal, payloadSize: payload?.length, mask, compressionBit: opcode == Opcode.continuation ? false : compress})
       await this.#write(head)
       if (payload?.length) await this.#write(payload)
     } catch (error) {      
@@ -202,14 +204,17 @@ export class ProtocolWriter {
 
   #compressPayload(payload, isFinal) {
     return new Promise(async (resolve, reject) => {
-      let compressedData
-      this.#deflater.once('data', data => {compressedData = data})
-      if (this.#deflater.writableNeedDrain) await drainPromise(this.#deflater)
+      const deflatedChunks = []
+      const onData = data => {deflatedChunks.push(data)}
+      this.#deflater.on('data', onData)
+      if (this.#deflater.writableNeedDrain) await drainPromise(this.#deflater) // never seen this happen, but just in case
       this.#deflater.write(payload, error => {
         if (error) return reject(error)
         this.#deflater.flush(isFinal && !this.#keepSlidingWindow ? zlib.constants.Z_FULL_FLUSH : zlib.constants.Z_SYNC_FLUSH, error => {
+          this.#deflater.off('data', onData)
           if (error) return reject(error)
-          if (!compressedData) return reject(Error('WTF?'))
+          if (!deflatedChunks.length) return reject(Error('WTF?'))
+          const compressedData = Buffer.concat(deflatedChunks)
           if (isFinal) { // then remove ZZZZFFFF
             resolve(compressedData.subarray(0, compressedData.length - 4))
           } else {

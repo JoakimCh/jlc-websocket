@@ -62,7 +62,7 @@ export async function handleWebSocketUpgrade({
         } else {
           config.compression = false
         }
-        const hash = await crypto.subtle.digest('SHA-1', clientKey+MAGIC_GUID)
+        const hash = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(clientKey+MAGIC_GUID))
         const acceptKey = Buffer.from(hash).toString('base64')
         ioStream.write(
           'HTTP/1.1 101 Switching Protocols\r\n'+

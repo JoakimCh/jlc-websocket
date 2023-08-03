@@ -15,7 +15,7 @@ export async function connectToServer({
 }) {
   const httpHeaders = {...config.httpHeaders}
   const secWebSocketKey = randomSecWebSocketKey()
-  const hash = await crypto.subtle.digest('SHA-1', secWebSocketKey+MAGIC_GUID)
+  const hash = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(secWebSocketKey+MAGIC_GUID))
   const acceptKey = Buffer.from(hash).toString('base64')
   const urlsTried = new Set()
   const result = Object.seal({
