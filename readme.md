@@ -1,17 +1,13 @@
 
 # jlc-websocket
 
-## Released as is
-
-For now I've decided to share this project as it is; which could mean missing documentation, tests and information. I just wanted to have it available online...
-
 ## About
 
-A lean and mean (not a lot of code bloat) WebSocket implementation for Node.js written in modern JavaScript. Why? Because I woke up one day and was ashamed that I hadn't written my own yet.
+A lean and mean (not a lot of code bloat) WebSocket implementation written from scratch for Node.js in modern JavaScript. No dependencies and no third-party libraries. Why? Because I woke up one day and was ashamed that I hadn't written my own yet...
 
-Should I use it? Yes, because it's awesome! It works on both the server side and the client side, has lots of features and is easy to use!
+Should I use it? Well, it works on both the server side and the client side, has some nice features and is easy to use! And it passes the [Autobahn](https://github.com/crossbario/autobahn-testsuite) WebSocket protocol test suite!
 
-An example:
+An example showing both server and client usage:
 ```js
 import {WebSocket} from 'jlc-websocket'
 import * as http from 'node:http'
@@ -42,23 +38,22 @@ function wsConnectionHandler(ws) {
 }
 ```
 
-## Features
+## Current features
 
 * Server and client implementation.
 * Compression support (the permessage-deflate extension).
 * Possibility to send and receive Node.js streams.
-* Configurable automatic reconnection (client side only).
 * Possibility to receive message fragments as they come.
 * UTF-8 verification using fast native functions.
 * Possibility to manually ping the connection with a custom payload.
 
-And btw, it passes the [Autobahn](https://github.com/crossbario/autobahn-testsuite) WebSocket protocol test suite.
+## Todo list
+
+* Configurable automatic reconnection (client side only).
 
 ## Documentation
 
 The API is compatible with the standard Web API described at MDN:
 https://developer.mozilla.org/en-US/docs/Web/API/WebSocket
 
-But in addition to that ...
-
-
+I will write further documentation later.
