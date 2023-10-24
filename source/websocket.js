@@ -64,7 +64,7 @@ export class WebSocket extends EventEmitter {
   #pingMutex = new Mutex() // unlocks when pong is received or times out
   #closeCalled; #closeFrameSent; #closeFrameReceived; #closeCode; #closeReason
   #forcedTerminationTimeout
-  /** Whether to send and receive messages as JSON. */
+  /** Whether to send and receive messages as JSON. Buffer, ArrayBuffer, TypedArray, DataView or Blob will still be sent and received as binary messages though (where binaryType represent their type then). */
   jsonMode
 
   get isClient() {return this.#isClient}
@@ -125,6 +125,7 @@ export class WebSocket extends EventEmitter {
     Object.defineProperty(this, '_events', {enumerable: false})
     Object.defineProperty(this, '_eventsCount', {enumerable: false})
     Object.defineProperty(this, '_maxListeners', {enumerable: false})
+    Object.seal(this) // this is useful to prevent mistakes
     const {url, protocols, config, request} = this.#handleArguments(arguments)
     this.config = {
       ...this.#defaultConfig,

@@ -25,6 +25,7 @@ export class ProtocolWriter {
   jsonMode
 
   constructor({webSocket, ioStream, errorHandler}) {
+    Object.seal(this) // this is useful to prevent mistakes
     this.#ioStream = ioStream
     this.#isClient =  webSocket.isClient
     this.#errorHandler = errorHandler
@@ -71,27 +72,30 @@ export class ProtocolWriter {
   }
 
   async send(data, allowCompression) {
-    if (this.jsonMode) {
-      data = JSON.stringify(data)
+    const typeError = 'Data sent with message() must either be a String, Buffer, ArrayBuffer, TypedArray, DataView or Blob.'
+    let isString = typeof data == 'string'
+    if (isString) {
+      if (this.jsonMode) data = JSON.stringify(data)
     } else {
-      const typeError = 'Data sent with message() must either be a String, Buffer, ArrayBuffer, TypedArray, DataView or Blob.'
-      if (typeof data == 'object') {
-        if (data instanceof Buffer) {
-          // all is good then
-        } else if (data instanceof ArrayBuffer) {
-          data = Buffer.from(data)
-        } else if (ArrayBuffer.isView(data)) {
-          data = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
-        } else if (data instanceof Blob) {
-          data = Buffer.from(await data.arrayBuffer())
-        } else {
-          throw new WebSocketError('TYPE_ERROR', typeError)
+      if (data instanceof Buffer) {
+        // all is good then
+      } else if (data instanceof ArrayBuffer) {
+        data = Buffer.from(data)
+      } else if (ArrayBuffer.isView(data)) {
+        data = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+      } else if (data instanceof Blob) {
+        data = Buffer.from(await data.arrayBuffer())
+      } else if (this.jsonMode) {
+        try {
+          data = JSON.stringify(data)
+          isString = true
+        } catch (error) {
+          throw new WebSocketError('TYPE_ERROR', 'jsonMode is true but the data was not compatible with JSON.stringify.', {cause: error})
         }
-      } else if (typeof data != 'string') {
+      } else {
         throw new WebSocketError('TYPE_ERROR', typeError)
       }
     }
-    const isString = typeof data == 'string'
     if (isString) data = Buffer.from(data)
     const compress = (() => {
       if (this.#compression && allowCompression) {

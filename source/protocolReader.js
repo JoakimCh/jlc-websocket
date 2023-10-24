@@ -54,6 +54,7 @@ export class ProtocolReader extends Transform {
     messageHandler, pingHandler, pongHandler, closeHandler
   }) {
     super(options)
+    Object.seal(this) // this is useful to prevent mistakes
     // this.#config = config
     this.binaryType = binaryType
     this.jsonMode = jsonMode
@@ -187,8 +188,7 @@ export class ProtocolReader extends Transform {
         return this.#error(1007, 'Invalid UTF-8 encoded text.')
       }
     }
-    if (this.jsonMode) {
-      if (typeof data != 'string') return this.#error(1007, 'Wanted JSON but received binary message.')
+    if (this.jsonMode && typeof data == 'string') {
       try {
         data = JSON.parse(data)
       } catch (error) {
